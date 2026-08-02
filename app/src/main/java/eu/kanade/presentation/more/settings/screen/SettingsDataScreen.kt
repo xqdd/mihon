@@ -1,10 +1,11 @@
 package eu.kanade.presentation.more.settings.screen
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
-import androidx.activity.compose.ManagedActivityResultLauncher
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
@@ -60,6 +61,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import logcat.LogPriority
 import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.core.common.storage.AndroidStorageFolderProvider
 import tachiyomi.core.common.storage.displayablePath
 import tachiyomi.core.common.util.lang.launchNonCancellable
 import tachiyomi.core.common.util.lang.withUIContext
@@ -114,10 +116,10 @@ object SettingsDataScreen : SearchableSettings {
     @Composable
     fun storageLocationPicker(
         storageDirPref: tachiyomi.core.common.preference.Preference<String>,
-    ): ManagedActivityResultLauncher<Uri?, Uri?> {
+    ): () -> Unit {
         val context = LocalContext.current
 
-        return rememberLauncherForActivityResult(
+        val documentTreePicker = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.OpenDocumentTree(),
         ) { uri ->
             if (uri != null) {
@@ -141,6 +143,58 @@ object SettingsDataScreen : SearchableSettings {
                 }
             }
         }
+
+        val fallbackFolderProvider = remember { Injekt.get<AndroidStorageFolderProvider>() }
+        val useLegacyStorageFallback = Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            context.packageManager.resolveActivity(
+                Intent(Intent.ACTION_OPEN_DOCUMENT_TREE),
+                PackageManager.MATCH_DEFAULT_ONLY,
+            ) == null
+
+        fun setFallbackStorageLocation() {
+            val fallbackDirectory = fallbackFolderProvider.directory()
+            if (fallbackDirectory.exists() || fallbackDirectory.mkdirs()) {
+                storageDirPref.set(fallbackFolderProvider.path())
+            }
+        }
+
+        val requestStoragePermission = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestPermission(),
+        ) { granted ->
+            if (granted) {
+                setFallbackStorageLocation()
+            }
+        }
+
+        val launchStorageLocationPicker: () -> Unit = {
+            if (useLegacyStorageFallback) {
+                // Keep existing SAF locations untouched; fallback is only for first-time setup.
+                if (!storageDirPref.isSet()) {
+                    if (
+                        context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        setFallbackStorageLocation()
+                    } else {
+                        requestStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    }
+                }
+            } else {
+                try {
+                    documentTreePicker.launch(null)
+                } catch (e: ActivityNotFoundException) {
+                    context.toast(MR.strings.file_picker_error)
+                }
+            }
+        }
+
+        LaunchedEffect(useLegacyStorageFallback, storageDirPref) {
+            if (useLegacyStorageFallback && !storageDirPref.isSet()) {
+                launchStorageLocationPicker()
+            }
+        }
+
+        return launchStorageLocationPicker
     }
 
     @Composable
@@ -164,19 +218,12 @@ object SettingsDataScreen : SearchableSettings {
     private fun getStorageLocationPref(
         storagePreferences: StoragePreferences,
     ): Preference.PreferenceItem.TextPreference {
-        val context = LocalContext.current
         val pickStorageLocation = storageLocationPicker(storagePreferences.baseStorageDirectory)
 
         return Preference.PreferenceItem.TextPreference(
             title = stringResource(MR.strings.pref_storage_location),
             subtitle = storageLocationText(storagePreferences.baseStorageDirectory),
-            onClick = {
-                try {
-                    pickStorageLocation.launch(null)
-                } catch (e: ActivityNotFoundException) {
-                    context.toast(MR.strings.file_picker_error)
-                }
-            },
+            onClick = pickStorageLocation,
         )
     }
 
