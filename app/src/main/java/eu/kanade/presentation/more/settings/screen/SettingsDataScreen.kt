@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
@@ -23,6 +24,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MultiChoiceSegmentedButtonRow
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
@@ -31,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.collectAsState as collectFlowAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -41,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import cafe.adriel.voyager.navigator.LocalNavigator
 import cafe.adriel.voyager.navigator.currentOrThrow
@@ -60,6 +64,7 @@ import eu.kanade.tachiyomi.data.export.LibraryExporter.ExportOptions
 import eu.kanade.tachiyomi.util.system.DeviceUtil
 import eu.kanade.tachiyomi.util.system.toast
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import logcat.LogPriority
 import tachiyomi.core.common.i18n.stringResource
@@ -148,31 +153,48 @@ object SettingsDataScreen : SearchableSettings {
         }
 
         val fallbackFolderProvider = remember { Injekt.get<AndroidStorageFolderProvider>() }
-        val fallbackDirectory = remember(fallbackFolderProvider) { fallbackFolderProvider.directory() }
+        val sharedFallbackDirectory = remember(fallbackFolderProvider) { fallbackFolderProvider.directory() }
+        val appSpecificStorageRoot = remember(context) {
+            context.getExternalFilesDir(null) ?: context.filesDir
+        }
 
-        // 裸文件路径仅在 Android 9 及以下可靠可用，高版本继续保留原有 SAF 行为。
-        val useLegacyStorageFallback = Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
-            context.packageManager.resolveActivity(
-                Intent(Intent.ACTION_OPEN_DOCUMENT_TREE),
-                PackageManager.MATCH_DEFAULT_ONLY,
-            ) == null
+        // Android 11 ignores legacy external storage, so use app-specific storage on scoped-storage devices.
+        val fallbackStorageRoot = remember(sharedFallbackDirectory, appSpecificStorageRoot) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                appSpecificStorageRoot
+            } else {
+                sharedFallbackDirectory.parentFile ?: sharedFallbackDirectory
+            }
+        }
+        val fallbackDirectory = remember(fallbackStorageRoot, sharedFallbackDirectory) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                fallbackStorageRoot.resolve(sharedFallbackDirectory.name)
+            } else {
+                sharedFallbackDirectory
+            }
+        }
 
-        var showLegacyStorageDialog by remember { mutableStateOf(false) }
-        var legacyStoragePath by remember { mutableStateOf(fallbackDirectory.absolutePath) }
-        var legacyStoragePathInvalid by remember { mutableStateOf(false) }
+        // Use the fallback on every Android version when no document tree picker is available.
+        val useStorageFallback = context.packageManager.resolveActivity(
+            Intent(Intent.ACTION_OPEN_DOCUMENT_TREE),
+            PackageManager.MATCH_DEFAULT_ONLY,
+        ) == null
+        val requiresLegacyStoragePermission = Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q
+
+        var showFallbackStorageDialog by remember { mutableStateOf(false) }
+        var fallbackStoragePath by remember { mutableStateOf(fallbackDirectory.absolutePath) }
+        var fallbackStoragePathInvalid by remember { mutableStateOf(false) }
         var showDialogAfterPermissionGrant by remember { mutableStateOf(false) }
 
-        fun setLegacyStorageLocation(path: String): Boolean {
+        fun setFallbackStorageLocation(path: String): Boolean {
             val requestedDirectory = File(path.trim())
             if (!requestedDirectory.isAbsolute) return false
 
             val directory = runCatching { requestedDirectory.canonicalFile }.getOrNull() ?: return false
-            val externalStorageRoot = runCatching {
-                fallbackDirectory.parentFile?.canonicalFile
-            }.getOrNull() ?: return false
+            val allowedStorageRoot = runCatching { fallbackStorageRoot.canonicalFile }.getOrNull() ?: return false
 
-            // 兼容模式仅允许主外部存储的子目录，避免误写系统目录或应用私有目录。
-            if (!directory.path.startsWith(externalStorageRoot.path + File.separator)) return false
+            // Restrict custom paths to the writable root selected for the current Android storage model.
+            if (!directory.path.startsWith(allowedStorageRoot.path + File.separator)) return false
 
             val directoryExists = directory.isDirectory
             val directoryCreated = !directory.exists() && directory.mkdirs()
@@ -183,45 +205,58 @@ object SettingsDataScreen : SearchableSettings {
             return true
         }
 
-        fun showLegacyStorageLocationDialog() {
+        fun showFallbackStorageLocationDialog() {
             val currentStorageUri = storageDirPref.get().toUri()
-            legacyStoragePath = currentStorageUri
+            fallbackStoragePath = currentStorageUri
                 .takeIf { it.scheme == ContentResolver.SCHEME_FILE }
                 ?.path
                 ?: fallbackDirectory.absolutePath
-            legacyStoragePathInvalid = false
-            showLegacyStorageDialog = true
+            fallbackStoragePathInvalid = false
+            showFallbackStorageDialog = true
         }
 
-        if (showLegacyStorageDialog) {
+        if (showFallbackStorageDialog) {
             AlertDialog(
-                onDismissRequest = { showLegacyStorageDialog = false },
+                onDismissRequest = { showFallbackStorageDialog = false },
                 title = { Text(stringResource(MR.strings.pref_storage_location)) },
                 text = {
-                    OutlinedTextField(
-                        modifier = Modifier.fillMaxWidth(),
-                        value = legacyStoragePath,
-                        onValueChange = {
-                            legacyStoragePath = it
-                            legacyStoragePathInvalid = false
-                        },
-                        label = { Text(stringResource(MR.strings.pref_storage_location)) },
-                        supportingText = if (legacyStoragePathInvalid) {
-                            { Text(stringResource(MR.strings.invalid_location, legacyStoragePath)) }
-                        } else {
-                            null
-                        },
-                        isError = legacyStoragePathInvalid,
-                        singleLine = true,
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            modifier = Modifier.fillMaxWidth(),
+                            value = fallbackStoragePath,
+                            onValueChange = {
+                                fallbackStoragePath = it
+                                fallbackStoragePathInvalid = false
+                            },
+                            label = { Text(stringResource(MR.strings.pref_storage_location)) },
+                            supportingText = if (fallbackStoragePathInvalid) {
+                                { Text(stringResource(MR.strings.invalid_location, fallbackStoragePath)) }
+                            } else {
+                                null
+                            },
+                            isError = fallbackStoragePathInvalid,
+                            singleLine = true,
+                        )
+                        Text(
+                            text = stringResource(
+                                if (requiresLegacyStoragePermission) {
+                                    MR.strings.storage_location_fallback_legacy_info
+                                } else {
+                                    MR.strings.storage_location_fallback_scoped_info
+                                },
+                                fallbackStorageRoot.absolutePath,
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                 },
                 confirmButton = {
                     TextButton(
                         onClick = {
-                            if (setLegacyStorageLocation(legacyStoragePath)) {
-                                showLegacyStorageDialog = false
+                            if (setFallbackStorageLocation(fallbackStoragePath)) {
+                                showFallbackStorageDialog = false
                             } else {
-                                legacyStoragePathInvalid = true
+                                fallbackStoragePathInvalid = true
                             }
                         },
                     ) {
@@ -229,7 +264,7 @@ object SettingsDataScreen : SearchableSettings {
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showLegacyStorageDialog = false }) {
+                    TextButton(onClick = { showFallbackStorageDialog = false }) {
                         Text(stringResource(MR.strings.action_cancel))
                     }
                 },
@@ -240,27 +275,27 @@ object SettingsDataScreen : SearchableSettings {
             contract = ActivityResultContracts.RequestPermission(),
         ) { granted ->
             if (granted) {
-                // 权限结果需要继续用户之前的操作：首次初始化或编辑现有兼容路径。
+                // Continue the action that originally required storage permission.
                 if (showDialogAfterPermissionGrant) {
-                    showLegacyStorageLocationDialog()
+                    showFallbackStorageLocationDialog()
                 } else {
-                    setLegacyStorageLocation(fallbackDirectory.absolutePath)
+                    setFallbackStorageLocation(fallbackDirectory.absolutePath)
                 }
             }
             showDialogAfterPermissionGrant = false
         }
 
         val launchStorageLocationPicker: () -> Unit = {
-            if (useLegacyStorageFallback) {
+            if (useStorageFallback) {
                 val customizeExistingLocation = storageDirPref.isSet()
-                if (
+                val storagePermissionGranted = !requiresLegacyStoragePermission ||
                     context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
                     PackageManager.PERMISSION_GRANTED
-                ) {
+                if (storagePermissionGranted) {
                     if (customizeExistingLocation) {
-                        showLegacyStorageLocationDialog()
+                        showFallbackStorageLocationDialog()
                     } else {
-                        setLegacyStorageLocation(fallbackDirectory.absolutePath)
+                        setFallbackStorageLocation(fallbackDirectory.absolutePath)
                     }
                 } else {
                     showDialogAfterPermissionGrant = customizeExistingLocation
@@ -275,8 +310,8 @@ object SettingsDataScreen : SearchableSettings {
             }
         }
 
-        LaunchedEffect(useLegacyStorageFallback, storageDirPref) {
-            if (useLegacyStorageFallback && !storageDirPref.isSet()) {
+        LaunchedEffect(useStorageFallback, storageDirPref) {
+            if (useStorageFallback && !storageDirPref.isSet()) {
                 launchStorageLocationPicker()
             }
         }
@@ -289,10 +324,13 @@ object SettingsDataScreen : SearchableSettings {
         storageDirPref: tachiyomi.core.common.preference.Preference<String>,
     ): String {
         val context = LocalContext.current
-        val storageDir by storageDirPref.collectAsState()
+        val storageLocationState by remember(storageDirPref) {
+            storageDirPref.changes().map { storageDirPref.isSet() to it }
+        }.collectFlowAsState(initial = storageDirPref.isSet() to storageDirPref.get())
+        val (isStorageDirSet, storageDir) = storageLocationState
 
-        // 默认值也是兼容模式的实际目录，必须根据偏好是否已写入区分首次设置状态。
-        if (!storageDirPref.isSet()) {
+        // The fallback path equals the preference default, so observe whether the preference was explicitly set.
+        if (!isStorageDirSet) {
             return stringResource(MR.strings.no_location_set)
         }
 
