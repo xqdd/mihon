@@ -168,7 +168,7 @@ object SettingsDataScreen : SearchableSettings {
 
         val launchStorageLocationPicker: () -> Unit = {
             if (useLegacyStorageFallback) {
-                // Keep existing SAF locations untouched; fallback is only for first-time setup.
+                // 仅首次设置时使用兼容目录，避免覆盖已有的 SAF 目录。
                 if (!storageDirPref.isSet()) {
                     if (
                         context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
