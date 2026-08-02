@@ -2,6 +2,7 @@ package eu.kanade.presentation.more.settings.screen
 
 import android.Manifest
 import android.content.ActivityNotFoundException
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -23,6 +24,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MultiChoiceSegmentedButtonRow
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.Text
@@ -77,6 +79,7 @@ import tachiyomi.presentation.core.i18n.stringResource
 import tachiyomi.presentation.core.util.collectAsState
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.File
 
 object SettingsDataScreen : SearchableSettings {
 
@@ -145,39 +148,123 @@ object SettingsDataScreen : SearchableSettings {
         }
 
         val fallbackFolderProvider = remember { Injekt.get<AndroidStorageFolderProvider>() }
+        val fallbackDirectory = remember(fallbackFolderProvider) { fallbackFolderProvider.directory() }
+
+        // 裸文件路径仅在 Android 9 及以下可靠可用，高版本继续保留原有 SAF 行为。
         val useLegacyStorageFallback = Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
             context.packageManager.resolveActivity(
                 Intent(Intent.ACTION_OPEN_DOCUMENT_TREE),
                 PackageManager.MATCH_DEFAULT_ONLY,
             ) == null
 
-        fun setFallbackStorageLocation() {
-            val fallbackDirectory = fallbackFolderProvider.directory()
-            if (fallbackDirectory.exists() || fallbackDirectory.mkdirs()) {
-                storageDirPref.set(fallbackFolderProvider.path())
-            }
+        var showLegacyStorageDialog by remember { mutableStateOf(false) }
+        var legacyStoragePath by remember { mutableStateOf(fallbackDirectory.absolutePath) }
+        var legacyStoragePathInvalid by remember { mutableStateOf(false) }
+        var showDialogAfterPermissionGrant by remember { mutableStateOf(false) }
+
+        fun setLegacyStorageLocation(path: String): Boolean {
+            val requestedDirectory = File(path.trim())
+            if (!requestedDirectory.isAbsolute) return false
+
+            val directory = runCatching { requestedDirectory.canonicalFile }.getOrNull() ?: return false
+            val externalStorageRoot = runCatching {
+                fallbackDirectory.parentFile?.canonicalFile
+            }.getOrNull() ?: return false
+
+            // 兼容模式仅允许主外部存储的子目录，避免误写系统目录或应用私有目录。
+            if (!directory.path.startsWith(externalStorageRoot.path + File.separator)) return false
+
+            val directoryExists = directory.isDirectory
+            val directoryCreated = !directory.exists() && directory.mkdirs()
+            val directoryReady = (directoryExists || directoryCreated) && directory.canWrite()
+            if (!directoryReady) return false
+
+            storageDirPref.set(directory.toUri().toString())
+            return true
+        }
+
+        fun showLegacyStorageLocationDialog() {
+            val currentStorageUri = storageDirPref.get().toUri()
+            legacyStoragePath = currentStorageUri
+                .takeIf { it.scheme == ContentResolver.SCHEME_FILE }
+                ?.path
+                ?: fallbackDirectory.absolutePath
+            legacyStoragePathInvalid = false
+            showLegacyStorageDialog = true
+        }
+
+        if (showLegacyStorageDialog) {
+            AlertDialog(
+                onDismissRequest = { showLegacyStorageDialog = false },
+                title = { Text(stringResource(MR.strings.pref_storage_location)) },
+                text = {
+                    OutlinedTextField(
+                        modifier = Modifier.fillMaxWidth(),
+                        value = legacyStoragePath,
+                        onValueChange = {
+                            legacyStoragePath = it
+                            legacyStoragePathInvalid = false
+                        },
+                        label = { Text(stringResource(MR.strings.pref_storage_location)) },
+                        supportingText = if (legacyStoragePathInvalid) {
+                            { Text(stringResource(MR.strings.invalid_location, legacyStoragePath)) }
+                        } else {
+                            null
+                        },
+                        isError = legacyStoragePathInvalid,
+                        singleLine = true,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            if (setLegacyStorageLocation(legacyStoragePath)) {
+                                showLegacyStorageDialog = false
+                            } else {
+                                legacyStoragePathInvalid = true
+                            }
+                        },
+                    ) {
+                        Text(stringResource(MR.strings.action_save))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showLegacyStorageDialog = false }) {
+                        Text(stringResource(MR.strings.action_cancel))
+                    }
+                },
+            )
         }
 
         val requestStoragePermission = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestPermission(),
         ) { granted ->
             if (granted) {
-                setFallbackStorageLocation()
+                // 权限结果需要继续用户之前的操作：首次初始化或编辑现有兼容路径。
+                if (showDialogAfterPermissionGrant) {
+                    showLegacyStorageLocationDialog()
+                } else {
+                    setLegacyStorageLocation(fallbackDirectory.absolutePath)
+                }
             }
+            showDialogAfterPermissionGrant = false
         }
 
         val launchStorageLocationPicker: () -> Unit = {
             if (useLegacyStorageFallback) {
-                // 仅首次设置时使用兼容目录，避免覆盖已有的 SAF 目录。
-                if (!storageDirPref.isSet()) {
-                    if (
-                        context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
-                        PackageManager.PERMISSION_GRANTED
-                    ) {
-                        setFallbackStorageLocation()
+                val customizeExistingLocation = storageDirPref.isSet()
+                if (
+                    context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    if (customizeExistingLocation) {
+                        showLegacyStorageLocationDialog()
                     } else {
-                        requestStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                        setLegacyStorageLocation(fallbackDirectory.absolutePath)
                     }
+                } else {
+                    showDialogAfterPermissionGrant = customizeExistingLocation
+                    requestStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 }
             } else {
                 try {
@@ -204,7 +291,8 @@ object SettingsDataScreen : SearchableSettings {
         val context = LocalContext.current
         val storageDir by storageDirPref.collectAsState()
 
-        if (storageDir == storageDirPref.defaultValue()) {
+        // 默认值也是兼容模式的实际目录，必须根据偏好是否已写入区分首次设置状态。
+        if (!storageDirPref.isSet()) {
             return stringResource(MR.strings.no_location_set)
         }
 
